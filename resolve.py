@@ -1,32 +1,52 @@
-#!/usr/bin/env python
+#! /usr/bin/python
 
 """
-
-resolve.py
-
-Perform an iterative resolution of a DNS name, type, class,
-starting from the root DNS servers.
-
-Author: Shumon Huque <shuque - @ - gmail.com>
-
+    Performs an iterative resolution of a DNS name, type, class, starting from
+    the root DNS servers. Modified for the intent of using it inside my own
+    Python scripts.
 """
+__author__ = "Shumon Huque"
+__copyright__ = "Copyright 2015, Shumon Huque"
+__credits__ = ["Shumon Huque"]
+__maintainer__ = ["John Lawrence M. Penafiel"]
+__email__ = "penafieljlm@gmail.com"
 
 import os, sys, getopt, time, random
 import dns.message, dns.query, dns.rdatatype, dns.rcode, dns.dnssec
 
-
 PROGNAME   = os.path.basename(sys.argv[0])
-VERSION    = "0.14"
-ROOTHINTS  = "./root.hints"               # root server names and addresses
+VERSION    = "0.14x"
+ROOTHINTS  = [
+    ('a.root-servers.net.', '198.41.0.4'), 
+    ('a.root-servers.net.', '2001:503:ba3e::2:30'), 
+    ('b.root-servers.net.', '192.228.79.201'), 
+    ('b.root-servers.net.', '2001:500:84::b'), 
+    ('c.root-servers.net.', '192.33.4.12'), 
+    ('c.root-servers.net.', '2001:500:2::c'), 
+    ('d.root-servers.net.', '199.7.91.13'), 
+    ('d.root-servers.net.', '2001:500:2d::d'), 
+    ('e.root-servers.net.', '192.203.230.10'), 
+    ('f.root-servers.net.', '192.5.5.241'), 
+    ('f.root-servers.net.', '2001:500:2f::f'), 
+    ('g.root-servers.net.', '192.112.36.4'), 
+    ('h.root-servers.net.', '128.63.2.53'), 
+    ('h.root-servers.net.', '2001:500:1::803f:235'), 
+    ('i.root-servers.net.', '192.36.148.17'), 
+    ('i.root-servers.net.', '2001:7fe::53'), 
+    ('j.root-servers.net.', '192.58.128.30'), 
+    ('j.root-servers.net.', '2001:503:c27::2:30'), 
+    ('k.root-servers.net.', '193.0.14.129'), 
+    ('k.root-servers.net.', '2001:7fd::1'), 
+    ('l.root-servers.net.', '199.7.83.42'), 
+    ('l.root-servers.net.', '2001:500:3::42'), 
+    ('m.root-servers.net.', '2001:dc3::35'), 
+    ('m.root-servers.net.', '202.12.27.33')
+]
 
-TIMEOUT    = 3                            # Query timeout in seconds
-RETRY      = 1                            # of full list (not implemented yet)
+# TODO: remove this
 MAX_CNAME  = 10                           # Max #CNAME indirections
 MAX_QUERY  = 300                          # Max number of queries
 MAX_DELEG  = 26                           # Max number of delegations
-
-# RootZone object
-RootZone   = None                         # Populated by get_root_zone()
 
 class Prefs:
     """Preferences"""
@@ -54,48 +74,6 @@ class Cache:
     ZoneDict   = dict()                   # dns.name.Name -> Zone
     NSDict     = dict()                   # dns.name.Name -> NameServer
 
-
-def printCache():
-    """Print zone and NS cache contents - for debugging"""
-    print("---------------------------- Zone Cache ----------------")
-    for zname, zobj in Cache.ZoneDict.items():
-        print("Zone: %s" % zname)
-        for ns in zobj.nslist:
-            print("    NS: %s" % Cache.NSDict[ns].name)
-    print("---------------------------- NS   Cache ----------------")
-    for nsname, nsobj in Cache.NSDict.items():
-        ipstring_list = " ".join([x.addr for x in nsobj.iplist])
-        print("%s %s" % (nsname, ipstring_list))
-    return
-
-
-def usage():
-    print("""
-%s version %s
-
-Usage: %s [-dmtsnx] <qname> [<qtype>] [<qclass>]
-       %s [-dmtsnx] -b <batchfile>
-
-     -d: print debugging output
-     -m: do qname minimization
-     -t: use TCP only
-     -v: verbose - trace query & zone path
-     -s: print summary statistics
-     -n: resolve all non-glue NS addresses in referrals
-     -x: workaround NXDOMAIN on empty non-terminals
-     -b <batchfile>: batch file mode
-
-When using -b, <batchfile> contains one (space separated) query name, type, 
-class per line.
-    """ % (PROGNAME, VERSION, PROGNAME, PROGNAME))
-    sys.exit(1)
-
-
-def dprint(msg):
-    if Prefs.DEBUG: print(">> DEBUG: %s" % msg)
-    return
-
-
 class Query:
     """Query name class"""
 
@@ -108,20 +86,18 @@ class Query:
         self.qtype = qtype
         self.qclass = qclass
         self.minimize = minimize
-        self.quiet = False                      # don't print anything
+        self.quiet = False                     
         self.rcode = None
         self.got_answer = False
         self.cname_chain = []
         self.answer_rrset = []
         self.full_answer_rrset = []
-
-    def print_full_answer(self):
-        if self.full_answer_rrset:
-            print("\n".join([x.to_text() for x in self.full_answer_rrset]))
+        self.zone_chain = []
+        self.forced_break = False
 
     def get_answer_ip_list(self):
         iplist = []
-        for rrset in self.answer_rrset:
+        for rrset in self.full_answer_rrset:
             if rrset.rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
                 for rr in rrset:
                     iplist.append(rr.to_text())
@@ -205,15 +181,7 @@ class Zone:
         return result
 
     def iplist_sorted_by_rtt(self):
-        return sorted(self.iplist(), key = lambda ip: ip.rtt)
-
-    def print_details(self):
-        print("ZONE: %s" % self.name)
-        for nsname in self.nslist:
-            nsobj = Cache.NSDict[nsname]
-            addresses = [x.addr for x in nsobj.iplist]
-            print("%s %s %s" % (self.name, nsobj.name, addresses))
-        return
+        return sorted(self.iplist(), key=lambda ip: ip.rtt)
 
     def __repr__(self):
         return "<Zone: %s>" % self.name
@@ -222,8 +190,7 @@ class Zone:
 def get_root_zone():
     """populate the Root Zone object from hints file"""
     z = Zone(dns.name.root)
-    for line in open(ROOTHINTS, 'r'):
-        name, addr = line.split()
+    for name, addr in ROOTHINTS:
         name = dns.name.from_text(name)
         nsobj = z.install_ns(name, clobber=False)
         nsobj.install_ip(addr)
@@ -239,7 +206,7 @@ def closest_zone(qname):
         return Cache.ZoneDict[dns.name.root]
 
 
-def get_ns_addrs(zone, message):
+def get_ns_addrs(zone, message, stats, timeout=3):
     """
     Populate nameserver addresses for zone.
     
@@ -277,14 +244,14 @@ def get_ns_addrs(zone, message):
             for addrtype in ['A', 'AAAA']:
                 nsquery = Query(name, addrtype, 'IN', Prefs.MINIMIZE)
                 nsquery.quiet = True
-                resolve_name(nsquery, closest_zone(nsquery.qname), inPath=False, nsQuery=True)
+                resolve_name(nsquery, closest_zone(nsquery.qname), stats, timeout=timeout, inPath=False, nsQuery=True)
                 for ip in nsquery.get_answer_ip_list():
                     nsobj.install_ip(ip)
 
     return
 
 
-def process_referral(message, query):
+def process_referral(message, query, stats, timeout=3):
 
     """Process referral. Returns a zone object for the referred zone"""
     global Prefs
@@ -293,12 +260,9 @@ def process_referral(message, query):
         if rrset.rdtype == dns.rdatatype.NS:
             break
     else:
-        print("ERROR: unable to find NS RRset in referral response")
         return None
 
     zonename = rrset.name
-    if Prefs.VERBOSE and not query.quiet:
-        print(">>        [Got Referral to zone: %s]" % zonename)
     if zonename in Cache.ZoneDict:
         zone = Cache.ZoneDict[zonename]
     else:
@@ -306,15 +270,15 @@ def process_referral(message, query):
         for rr in rrset:
             nsobj = zone.install_ns(rr.target)
 
-    get_ns_addrs(zone, message)
+    get_ns_addrs(zone, message, stats, timeout=timeout)
     return zone
 
 
-def process_answer(response, query, addResults=None):
+def process_answer(response, query, stats, timeout=3, addResults=None):
 
     """Process answer section, chasing aliases when needed"""
 
-    global Stats, Prefs
+    global Prefs
     answer = response.answer
 
     # If minimizing, then we ignore answers for intermediate query names.
@@ -322,43 +286,34 @@ def process_answer(response, query, addResults=None):
         return answer
 
     empty_answer = (len(answer) == 0)
-    if empty_answer:
-        if not query.quiet:
-            print("ERROR: NODATA: %s of type %s not found" % \
-                  (query.qname, query.qtype))
 
     for rrset in answer:
         if rrset.rdtype == dns.rdatatype.from_text(query.qtype) and \
-           rrset.name == query.qname:
-            query.answer_rrset.append(rrset)
-            addResults and addResults.full_answer_rrset.append(rrset)
-            query.got_answer = True
+            rrset.name == query.qname:
+                query.answer_rrset.append(rrset)
+                addResults and addResults.full_answer_rrset.append(rrset)
+                query.got_answer = True
         elif rrset.rdtype == dns.rdatatype.DNAME:
             query.answer_rrset.append(rrset)
             addResults and addResults.full_answer_rrset.append(rrset)
-            if Prefs.VERBOSE:
-                print(rrset.to_text())
         elif rrset.rdtype == dns.rdatatype.CNAME:
             query.answer_rrset.append(rrset)
             addResults and addResults.full_answer_rrset.append(rrset)
-            if Prefs.VERBOSE:
-                print(rrset.to_text())
             cname = rrset[0].target
-            Stats.cnt_cname += 1
-            if Stats.cnt_cname >= MAX_CNAME:
-                print("ERROR: Too many (%d) CNAME indirections." % MAX_CNAME)
+            stats.cnt_cname += 1
+            if stats.cnt_cname >= MAX_CNAME:
                 return None
             else:
-                dprint("CNAME found, resolving canonical name %s" % cname)
                 cname_query = Query(cname, query.qtype, query.qclass, Prefs.MINIMIZE)
                 addResults and addResults.cname_chain.append(cname_query)
-                resolve_name(cname_query, closest_zone(cname), 
+                resolve_name(cname_query, closest_zone(cname), stats, timeout=timeout,
                              inPath=False, addResults=addResults)
-
+                for zone in cname_query.zone_chain:
+                    query.zone_chain.append(zone)
     return answer
 
 
-def process_response(response, query, addResults=None):
+def process_response(response, query, stats, timeout=3, addResults=None):
 
     """process a DNS response. Returns rcode, answer message, zone referral"""
 
@@ -371,102 +326,77 @@ def process_response(response, query, addResults=None):
     if rc == dns.rcode.NOERROR:
         answerlen = len(response.answer)
         if answerlen == 0 and not aa:                    # Referral
-            referral = process_referral(response, query)
-            if referral:
-                dprint("Obtained referral to zone: %s" % referral.name)
-            else:
-                print("ERROR: processing referral")
+            referral = process_referral(response, query, stats, timeout=timeout)
         else:                                            # Answer
-                ans = process_answer(response, query, addResults=addResults)
-    elif rc == dns.rcode.NXDOMAIN:                       # NXDOMAIN
-        if not query.quiet:
-            print("ERROR: NXDOMAIN: %s not found" % query.qname)
+            ans = process_answer(response, query, stats, timeout=timeout, addResults=addResults)
 
     return (rc, ans, referral)
 
 
-def update_query_counts(ip, nsQuery=False, tcp=False):
+def update_query_counts(stats, ip, nsQuery=False, tcp=False):
     """Update query counts in Statistics"""
-    global Stats
     ip.query_count += 1
     if tcp:
-        Stats.cnt_tcp += 1
+        stats.cnt_tcp += 1
     else:
         if nsQuery:
-            Stats.cnt_query2 += 1
+            stats.cnt_query2 += 1
         else:
-            Stats.cnt_query1 += 1
+            stats.cnt_query1 += 1
     return
 
 
-def send_query(query, zone, nsQuery=False):
+def send_query(query, zone, stats, timeout=3, nsQuery=False):
     """send DNS query to nameservers of given zone"""
-    global Prefs, Stats
+    global Prefs
     response = None
-
-    if Prefs.DEBUG or (Prefs.VERBOSE and not query.quiet):
-        print(">> Query: %s %s %s at zone %s" % \
-               (query.qname, query.qtype, query.qclass, zone.name))
 
     msg = dns.message.make_query(query.qname, query.qtype, rdclass=query.qclass)
     msg.flags ^= dns.flags.RD
 
     nsaddr_list = zone.iplist_sorted_by_rtt();
     if len(nsaddr_list) == 0:
-        print("ERROR: No nameserver addresses found for zone: %s." % zone.name)
         return response
 
     for nsaddr in nsaddr_list:
-        if Stats.cnt_query1 + Stats.cnt_query2 >= MAX_QUERY:
-            print("ERROR: Max number of queries (%d) exceeded." % MAX_QUERY)
+        if stats.cnt_query1 + stats.cnt_query2 >= MAX_QUERY:
             return response
-        dprint("Querying zone %s at address %s" % (zone.name, nsaddr.addr))
         try:
-            update_query_counts(ip=nsaddr, nsQuery=nsQuery)
-            msg.id = random.randint(1,65535)          # randomize txid
+            update_query_counts(stats, ip=nsaddr, nsQuery=nsQuery)
+            msg.id = random.randint(1, 65535)          # randomize txid
             truncated = False
             if not Prefs.TCPONLY:
                 t1 = time.time()
-                response = dns.query.udp(msg, nsaddr.addr, timeout=TIMEOUT,
+                response = dns.query.udp(msg, nsaddr.addr, timeout=timeout,
                                          ignore_unexpected=True)
                 t2 = time.time()
                 nsaddr.rtt = (t2 - t1)
                 truncated = (response.flags & dns.flags.TC == dns.flags.TC)
             if Prefs.TCPONLY or truncated:
-                update_query_counts(ip=nsaddr, nsQuery=nsQuery, tcp=True)
-                if truncated:
-                    dprint("WARNING: Truncated response; Retrying with TCP ..")
-                response = dns.query.tcp(msg, nsaddr.addr, timeout=TIMEOUT)
+                update_query_counts(stats, ip=nsaddr, nsQuery=nsQuery, tcp=True)
+                response = dns.query.tcp(msg, nsaddr.addr, timeout=timeout)
         except Exception as e:
-            print("Query failed: %s (%s, %s)" % (nsaddr.addr, type(e).__name__, e))
-            Stats.cnt_fail += 1
+            stats.cnt_fail += 1
             pass
         else:
             rc = response.rcode()
             if rc not in [dns.rcode.NOERROR, dns.rcode.NXDOMAIN]:
-                Stats.cnt_fail += 1
-                print("WARNING: response %s from %s" % (dns.rcode.to_text(rc), nsaddr.addr))
+                stats.cnt_fail += 1
             else:
                 break
-    else:
-        print("ERROR: Queries to all servers for zone %s failed." % zone.name)
 
     return response
 
 
-def resolve_name(query, zone, inPath=True, nsQuery=False, addResults=None):
+def resolve_name(query, zone, stats, timeout=3, inPath=True, nsQuery=False, addResults=None, callback=None):
     """resolve a DNS query. addResults is an optional Query object to
     which the answer results are to be added."""
 
-    global Prefs, Stats
+    global Prefs
     curr_zone = zone
     repeatZone = False
 
-    while Stats.cnt_deleg < MAX_DELEG:
-
-        if Prefs.DEBUG:
-            print("\n>> Current Zone: %s" % curr_zone.name)
-            curr_zone.print_details()
+    while stats.cnt_deleg < MAX_DELEG:
 
         if query.minimize:
             if repeatZone:
@@ -475,11 +405,19 @@ def resolve_name(query, zone, inPath=True, nsQuery=False, addResults=None):
             else:
                 query.set_minimized(curr_zone)
 
-        response = send_query(query, curr_zone, nsQuery=nsQuery)
+        query.zone_chain.append(curr_zone)
+
+        if callback is not None:
+            if callback([[ns.to_text()[:-1] for ns in zone.nslist] for zone in query.zone_chain]):
+                query.forced_break = True
+                return
+        
+        response = send_query(query, curr_zone, stats, timeout=timeout, nsQuery=nsQuery)
+        
         if not response:
             return
 
-        rc, ans, referral = process_response(response, query, addResults=addResults)
+        rc, ans, referral = process_response(response, query, stats, timeout=timeout, addResults=addResults)
 
         if rc == dns.rcode.NXDOMAIN:
             # for broken servers that give NXDOMAIN for empty non-terminals
@@ -494,158 +432,20 @@ def resolve_name(query, zone, inPath=True, nsQuery=False, addResults=None):
             elif query.minimize:
                 repeatZone = True
         else:
-            Stats.cnt_deleg += 1
+            stats.cnt_deleg += 1
             if inPath:
-                Stats.delegation_depth += 1
+                stats.delegation_depth += 1
             curr_zone = referral
 
-    if Stats.cnt_deleg >= MAX_DELEG:
-        print("ERROR: Max levels of delegation (%d) reached." % MAX_DELEG)
-
     return
 
-
-def do_batchmode(RootZone):
-    """Execute batch mode on input file supplied to -b"""
-
-    global Prefs, Stats
-    print("### resolve.py: Batch Mode file: %s" % Prefs.BATCHFILE)
-    linenum = 0
-    for line in open(Prefs.BATCHFILE):
-        linenum += 1
-        line = line.rstrip('\n')
-        parts = line.split()
-        if len(parts) == 1:
-            qname, = parts
-            qtype = 'A'
-            qclass = 'IN'
-        elif len(parts) == 2:
-            qname, qtype = parts
-            qclass = 'IN'
-        elif len(parts) == 3:
-            qname, qtype, qclass = parts
-        else:
-            print("\nERROR input line %d: %s" % (linenum, line))
-            continue
-
-        Stats.cnt_cname = 0
-        Stats.cnt_deleg = 0
-        Stats.cnt_query1 = 0
-        Stats.cnt_query2 = 0
-        Stats.cnt_fail = 0
-        Stats.cnt_tcp = 0
-        print("\n### INPUT: %s, %s, %s" % (qname, qtype, qclass))
-        query = Query(qname, qtype, qclass, minimize=Prefs.MINIMIZE)
-        starting_zone = closest_zone(query.qname)
-        print("### Query: %s" % query)
-        print("### Starting at zone: %s" % starting_zone)
-        resolve_name(query, starting_zone, addResults=query)
-        query.print_full_answer()
-
-    print("\n### End Batch Mode.")
-    return
-
-
-def print_stats():
-    """Print some statistics"""
-    global Stats
-    print('')
-    cnt_query_total = Stats.cnt_query1 + Stats.cnt_query2
-    print("Qname Delegation depth: %d" % Stats.delegation_depth)
-    print("Number of delegations traversed: %d" % Stats.cnt_deleg)
-    print("Number of queries performed (regular): %d" % Stats.cnt_query1)
-    print("Number of queries performed:(nsaddr)   %d" % Stats.cnt_query2)
-    if Stats.cnt_tcp:
-        print("Number of TCP fallbacks: %d" % Stats.cnt_tcp)
-    if Stats.cnt_fail:
-        print("Number of queries failed: %d (%.2f%%)" %
-              (Stats.cnt_fail, (100.0 * Stats.cnt_fail/cnt_query_total)))
-    if Stats.cnt_cname:
-        print("Number of CNAME indirections: %d" % Stats.cnt_cname)
-    return
-
-
-def exit_status(query):
-    """Obtain final exit status code"""
-    if query.cname_chain:
-        last_cname = query.cname_chain.pop()
-        rcode = last_cname.rcode
-        got_answer = last_cname.got_answer
-    else:
-        rcode = query.rcode
-        got_answer = query.got_answer
-
-    if rcode == 0 and got_answer:
-        return 0
-    else:
-        return 1
-
-
-def process_args(arguments):
-    """Process all command line arguments"""
-
-    global Prefs
-
-    try:
-        (options, args) = getopt.getopt(arguments, 'dmtvsnxb:')
-    except getopt.GetoptError:
-        usage()
-
-    for (opt, optval) in options:
-        if opt == "-d":
-            Prefs.DEBUG = True
-        elif opt == "-m":
-            Prefs.MINIMIZE = True
-        elif opt == "-t":
-            Prefs.TCPONLY = True
-        elif opt == "-v":
-            Prefs.VERBOSE = True
-        elif opt == "-s":
-            Prefs.STATS = True
-        elif opt == "-n":
-            Prefs.NSRESOLVE = True
-        elif opt == "-x":
-            Prefs.VIOLATE = True
-        elif opt == "-b":
-            Prefs.BATCHFILE = optval
-
-    if Prefs.BATCHFILE:
-        if not args:
-            return (None, None, None)
-        else:
-            usage()
-
-    numargs = len(args)
-    if numargs == 1:
-        qname, = args
-        qtype = 'A'
-        qclass = 'IN'
-    elif numargs == 2:
-        qname, qtype = args
-        qclass = 'IN'
-    elif numargs == 3:
-        qname, qtype, qclass = args
-    else:
-        usage()
-
-    return (qname, qtype, qclass)
-
-
-if __name__ == '__main__':
-
+def resolve(domain, timeout=3, callback=None):
     random.seed(os.urandom(64))
-    qname, qtype, qclass = process_args(sys.argv[1:])
-    RootZone = get_root_zone()
-
-    if Prefs.BATCHFILE:
-        do_batchmode(RootZone)
-        sys.exit(0)
-    else:
-        query = Query(qname, qtype, qclass, minimize=Prefs.MINIMIZE)
-        resolve_name(query, RootZone, addResults=query)
-        query.print_full_answer()
-
-        if Prefs.DEBUG or Prefs.STATS:
-            print_stats()
-
-        sys.exit(exit_status(query))
+    query = Query(domain, 'A', 'IN', minimize=Prefs.MINIMIZE)
+    stats = Stats()
+    resolve_name(query, get_root_zone(), stats, timeout=timeout, addResults=query, callback=callback)
+    return (
+            query.get_answer_ip_list(),
+            [[ns.to_text()[:-1] for ns in zone.nslist] for zone in query.zone_chain],
+            query.forced_break
+            )
