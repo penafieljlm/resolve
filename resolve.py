@@ -97,10 +97,16 @@ class Query:
 
     def get_answer_ip_list(self):
         iplist = []
+        for rrset in self.answer_rrset:
+            if rrset.rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
+                for rr in rrset:
+                    rr = rr.to_text()
+                    if rr not in iplist: iplist.append(rr)
         for rrset in self.full_answer_rrset:
             if rrset.rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
                 for rr in rrset:
-                    iplist.append(rr.to_text())
+                    rr = rr.to_text()
+                    if rr not in iplist: iplist.append(rr)
         return iplist
 
     def set_minimized(self, zone):
